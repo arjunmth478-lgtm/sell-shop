@@ -268,5 +268,5 @@ export default {
     ok: false,
     error: "Server error. Check the Cloudflare Worker logs."
   }, 500);
+          }
 }
-    }
