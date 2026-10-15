@@ -255,9 +255,17 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname.startsWith("/api/")) {
-      try { return await api(request, env); }
-      catch (e) { return json({ok:false,error:"Server error. Check the Cloudflare Worker logs."},500); }
-    }
-    return env.ASSETS.fetch(request);
-  }
-};
+      try {
+  return await api(request, env);
+} catch (e) {
+  console.error("SHOPNIX_API_ERROR", {
+    path: new URL(request.url).pathname,
+    message: e?.message || String(e),
+    stack: e?.stack || ""
+  });
+
+  return json({
+    ok: false,
+    error: "Server error. Check the Cloudflare Worker logs."
+  }, 500);
+}
