@@ -1,4 +1,4 @@
-```javascript
+
 const ADMIN_EMAIL = "arjunmth2007@gmail.com";
 const ADMIN_PASSWORD = "Raftaar@123";
 const SESSION_DAYS = 7;
@@ -632,4 +632,3 @@ export default {
     return env.ASSETS.fetch(request);
   }
 };
-```
