@@ -19,8 +19,7 @@ const enc = new TextEncoder();
 
 async function sha256(value) {
   const hash = await crypto.subtle.digest("SHA-256", enc.encode(value));
-  return [...new Uint8Array(hash)]
-    .map(x => x.toString(16).padStart(2, "0")).join("");
+  return [...new Uint8Array(hash)].map(x => x.toString(16).padStart(2, "0")).join("");
 }
 
 async function passwordHash(password, salt) {
@@ -29,8 +28,7 @@ async function passwordHash(password, salt) {
 
 function cookieValue(request, name) {
   const cookie = request.headers.get("Cookie") || "";
-  const item = cookie.split(";").map(v => v.trim())
-    .find(v => v.startsWith(`${name}=`));
+  const item = cookie.split(";").map(v => v.trim()).find(v => v.startsWith(`${name}=`));
   return item ? decodeURIComponent(item.slice(name.length + 1)) : "";
 }
 
@@ -41,12 +39,10 @@ function sessionCookie(token, maxAge = SESSION_DAYS * 86400) {
 async function getSession(request, env) {
   const token = cookieValue(request, "shopnix_session");
   if (!token) return null;
-
   const tokenHash = await sha256(token);
   const row = await env.DB.prepare(
     "SELECT user_id, role, expires_at FROM sessions WHERE token_hash = ? AND expires_at > ?"
   ).bind(tokenHash, Math.floor(Date.now() / 1000)).first();
-
   return row ? { ...row, tokenHash } : null;
 }
 
@@ -54,20 +50,14 @@ async function newSession(env, userId, role) {
   const token = `${uid()}${uid().replaceAll("-", "")}`;
   const tokenHash = await sha256(token);
   const expires = Math.floor(Date.now() / 1000) + SESSION_DAYS * 86400;
-
   await env.DB.prepare(
     "INSERT INTO sessions (token_hash,user_id,role,expires_at) VALUES (?,?,?,?)"
   ).bind(tokenHash, userId, role, expires).run();
-
   return token;
 }
 
 async function readBody(request) {
-  try {
-    return await request.json();
-  } catch {
-    return null;
-  }
+  try { return await request.json(); } catch { return null; }
 }
 
 function str(value, max = 500) {
@@ -80,31 +70,21 @@ function int(value, min = 0, max = 100000000) {
 }
 
 async function allSettings(env) {
-  const result = await env.DB.prepare(
-    "SELECT key,value FROM settings"
-  ).all();
-
-  return Object.fromEntries(
-    (result.results || []).map(row => [row.key, row.value])
-  );
+  const result = await env.DB.prepare("SELECT key,value FROM settings").all();
+  return Object.fromEntries((result.results || []).map(row => [row.key, row.value]));
 }
 
 async function ensureColumn(env, table, column, definition) {
   const info = await env.DB.prepare(`PRAGMA table_info(${table})`).all();
-  const exists = (info.results || []).some(row => row.name === column);
-
-  if (!exists) {
-    await env.DB.prepare(
-      `ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`
-    ).run();
+  if (!(info.results || []).some(row => row.name === column)) {
+    await env.DB.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run();
   }
 }
 
 async function ensureSchema(env) {
   await env.DB.prepare(`
     CREATE TABLE IF NOT EXISTS categories (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL UNIQUE
+      id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE
     )
   `).run();
 
@@ -139,11 +119,21 @@ async function ensureSchema(env) {
   await ensureColumn(env, "products", "price_paise", "INTEGER NOT NULL DEFAULT 0");
   await ensureColumn(env, "products", "stock", "INTEGER NOT NULL DEFAULT 0");
   await ensureColumn(env, "products", "image_url", "TEXT NOT NULL DEFAULT ''");
+  await ensureColumn(env, "products", "images_json", "TEXT NOT NULL DEFAULT '[]'");
+  await ensureColumn(env, "products", "video_url", "TEXT NOT NULL DEFAULT ''");
   await ensureColumn(env, "products", "active", "INTEGER NOT NULL DEFAULT 1");
   await ensureColumn(env, "products", "created_at", "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP");
 }
 
 function productOut(p) {
+  let images = [];
+  try {
+    const parsed = JSON.parse(p.images_json || "[]");
+    if (Array.isArray(parsed)) images = parsed;
+  } catch {}
+
+  if (!images.length && p.image_url) images = [p.image_url];
+
   return {
     id: p.id,
     name: p.name,
@@ -152,8 +142,83 @@ function productOut(p) {
     price: Number(p.price_paise || 0) / 100,
     stock: Number(p.stock || 0),
     imageUrl: p.image_url || "",
+    images,
+    videoUrl: p.video_url || "",
     active: Boolean(p.active)
   };
+}
+
+function parseDataUrl(value) {
+  const match = /^data:([a-zA-Z0-9.+-]+\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)$/.exec(value || "");
+  if (!match) return null;
+
+  const mime = match[1].toLowerCase();
+  const allowed = new Set([
+    "image/jpeg", "image/png", "image/webp", "image/gif",
+    "video/mp4", "video/webm", "video/quicktime"
+  ]);
+
+  if (!allowed.has(mime)) throw new Error("Unsupported media type: " + mime);
+
+  const raw = atob(match[2].replace(/\s/g, ""));
+  const bytes = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+
+  const max = mime.startsWith("image/") ? 5 * 1024 * 1024 : 25 * 1024 * 1024;
+  if (bytes.byteLength > max) {
+    throw new Error(mime.startsWith("image/")
+      ? "Each image must be 5 MB or smaller."
+      : "Video must be 25 MB or smaller.");
+  }
+
+  return { mime, bytes };
+}
+
+async function storeMedia(value, env, folder) {
+  if (typeof value !== "string" || !value) return "";
+  if (/^https:\/\//i.test(value) || value.startsWith("/media/")) return value;
+
+  const parsed = parseDataUrl(value);
+  if (!parsed) throw new Error("Media must be an HTTPS URL or a supported uploaded file.");
+
+  if (!env.MEDIA) {
+    throw new Error("R2 binding MEDIA missing. Add the shopnix-media bucket as MEDIA in Worker Settings > Bindings.");
+  }
+
+  const ext = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+    "image/gif": "gif",
+    "video/mp4": "mp4",
+    "video/webm": "webm",
+    "video/quicktime": "mov"
+  }[parsed.mime];
+
+  const key = `${folder}/${uid()}.${ext}`;
+  await env.MEDIA.put(key, parsed.bytes, {
+    httpMetadata: {
+      contentType: parsed.mime,
+      cacheControl: "public, max-age=31536000, immutable"
+    }
+  });
+
+  return `/media/${key}`;
+}
+
+async function mediaResponse(request, env, key) {
+  if (!env.MEDIA) return new Response("Media storage is not configured.", { status: 503 });
+
+  const object = await env.MEDIA.get(key);
+  if (!object) return new Response("Not found", { status: 404 });
+
+  const headers = new Headers();
+  object.writeHttpMetadata(headers);
+  headers.set("etag", object.httpEtag);
+  headers.set("cache-control", "public, max-age=31536000, immutable");
+  headers.set("x-content-type-options", "nosniff");
+
+  return new Response(request.method === "HEAD" ? null : object.body, { headers });
 }
 
 async function api(request, env) {
@@ -169,9 +234,7 @@ async function api(request, env) {
 
   if (method === "GET" && path === "/api/bootstrap") {
     const [products, categories, settings, visits] = await Promise.all([
-      env.DB.prepare(
-        "SELECT * FROM products WHERE active=1 ORDER BY created_at DESC"
-      ).all(),
+      env.DB.prepare("SELECT * FROM products WHERE active=1 ORDER BY created_at DESC").all(),
       env.DB.prepare("SELECT id,name FROM categories ORDER BY name").all(),
       allSettings(env),
       env.DB.prepare("SELECT COUNT(*) AS n FROM visits").first()
@@ -199,14 +262,10 @@ async function api(request, env) {
     const email = str(body.email, 254).toLowerCase();
     const password = typeof body.password === "string" ? body.password : "";
 
-    if (name.length < 2 ||
-        !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    if (name.length < 2 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       return bad("Enter a valid name and email.");
     }
-
-    if (password.length < 8) {
-      return bad("Password must be at least 8 characters.");
-    }
+    if (password.length < 8) return bad("Password must be at least 8 characters.");
 
     const id = uid();
     const salt = uid();
@@ -218,7 +277,6 @@ async function api(request, env) {
       ).bind(id, name, email, hash).run();
 
       const token = await newSession(env, id, "customer");
-
       return json({
         ok: true,
         user: { id, name, email, role: "customer" }
@@ -237,22 +295,13 @@ async function api(request, env) {
     const password = typeof body.password === "string" ? body.password : "";
 
     if (email === ADMIN_EMAIL.toLowerCase()) {
-      if (ADMIN_PASSWORD.startsWith("CHANGE_THIS_")) {
-        return bad("Set ADMIN_PASSWORD in worker.js before admin login.", 500);
-      }
-
       const valid = (await sha256(password)) === (await sha256(ADMIN_PASSWORD));
       if (!valid) return bad("Email or password is incorrect.", 401);
 
       const token = await newSession(env, "admin", "admin");
       return json({
         ok: true,
-        user: {
-          id: "admin",
-          name: "Shopnix Admin",
-          email: ADMIN_EMAIL,
-          role: "admin"
-        }
+        user: { id: "admin", name: "Shopnix Admin", email: ADMIN_EMAIL, role: "admin" }
       }, 200, { "set-cookie": sessionCookie(token) });
     }
 
@@ -263,8 +312,7 @@ async function api(request, env) {
     if (!user) return bad("Email or password is incorrect.", 401);
 
     const parts = String(user.password_hash).split(":");
-    if (parts.length !== 2 ||
-        await passwordHash(password, parts[0]) !== parts[1]) {
+    if (parts.length !== 2 || await passwordHash(password, parts[0]) !== parts[1]) {
       return bad("Email or password is incorrect.", 401);
     }
 
@@ -282,12 +330,7 @@ async function api(request, env) {
     if (session.role === "admin") {
       return json({
         ok: true,
-        user: {
-          id: "admin",
-          name: "Shopnix Admin",
-          email: ADMIN_EMAIL,
-          role: "admin"
-        }
+        user: { id: "admin", name: "Shopnix Admin", email: ADMIN_EMAIL, role: "admin" }
       });
     }
 
@@ -295,32 +338,21 @@ async function api(request, env) {
       "SELECT id,name,email FROM users WHERE id=?"
     ).bind(session.user_id).first();
 
-    return json({
-      ok: true,
-      user: user ? { ...user, role: "customer" } : null
-    });
+    return json({ ok: true, user: user ? { ...user, role: "customer" } : null });
   }
 
   if (method === "POST" && path === "/api/logout") {
     const session = await getSession(request, env);
-
     if (session) {
-      await env.DB.prepare(
-        "DELETE FROM sessions WHERE token_hash=?"
-      ).bind(session.tokenHash).run();
+      await env.DB.prepare("DELETE FROM sessions WHERE token_hash=?")
+        .bind(session.tokenHash).run();
     }
-
-    return json({ ok: true }, 200, {
-      "set-cookie": sessionCookie("", 0)
-    });
+    return json({ ok: true }, 200, { "set-cookie": sessionCookie("", 0) });
   }
 
   if (path.startsWith("/api/admin/")) {
     const session = await getSession(request, env);
-
-    if (!session || session.role !== "admin") {
-      return bad("Admin login required.", 401);
-    }
+    if (!session || session.role !== "admin") return bad("Admin login required.", 401);
 
     if (method === "GET" && path === "/api/admin/data") {
       const [products, categories, settings, visits, customers] = await Promise.all([
@@ -351,35 +383,61 @@ async function api(request, env) {
       const category = str(body.category, 100);
       const price = Number(body.price);
       const stock = int(body.stock, 0, 1000000);
-      const imageUrl = str(body.imageUrl, 1500);
 
       if (!name || !category || !Number.isFinite(price) ||
           price < 0 || price > 10000000 || stock === null) {
         return bad("Check product name, category, price and stock.");
       }
 
-      if (imageUrl && !/^https:\/\/|^data:image\//i.test(imageUrl)) {
-        return bad("Product image must use HTTPS or an image data URL.");
+      try {
+        let images = Array.isArray(body.images) ? body.images.slice(0, 5) : [];
+        const old = await env.DB.prepare(
+          "SELECT image_url,images_json,video_url FROM products WHERE id=?"
+        ).bind(id).first();
+
+        if (!images.length && body.imageUrl) images = [body.imageUrl];
+
+        const savedImages = [];
+        for (const image of images) {
+          const saved = await storeMedia(str(image, 12000000), env, `products/${id}/images`);
+          if (saved) savedImages.push(saved);
+        }
+
+        let imageUrl = savedImages[0] || "";
+        let videoUrl = body.videoUrl
+          ? await storeMedia(str(body.videoUrl, 40000000), env, `products/${id}/videos`)
+          : "";
+
+        if (!images.length && old) {
+          imageUrl = old.image_url || "";
+          try { savedImages.push(...JSON.parse(old.images_json || "[]")); } catch {}
+        }
+        if (!body.videoUrl && old) videoUrl = old.video_url || "";
+
+        await env.DB.prepare(`
+          INSERT INTO products
+            (id,name,description,category,price_paise,stock,image_url,images_json,video_url,active)
+          VALUES (?,?,?,?,?,?,?,?,?,1)
+          ON CONFLICT(id) DO UPDATE SET
+            name=excluded.name,
+            description=excluded.description,
+            category=excluded.category,
+            price_paise=excluded.price_paise,
+            stock=excluded.stock,
+            image_url=excluded.image_url,
+            images_json=excluded.images_json,
+            video_url=excluded.video_url,
+            active=1
+        `).bind(
+          id, name, description, category, Math.round(price * 100), stock,
+          imageUrl, JSON.stringify(savedImages), videoUrl
+        ).run();
+
+        return json({ ok: true, id, imageUrl, images: savedImages, videoUrl });
+      } catch (error) {
+        console.error("Product save error:", error?.stack || String(error));
+        return bad(error?.message || "Could not save product media.", 400);
       }
-
-      await env.DB.prepare(`
-        INSERT INTO products
-          (id,name,description,category,price_paise,stock,image_url,active)
-        VALUES (?,?,?,?,?,?,?,1)
-        ON CONFLICT(id) DO UPDATE SET
-          name=excluded.name,
-          description=excluded.description,
-          category=excluded.category,
-          price_paise=excluded.price_paise,
-          stock=excluded.stock,
-          image_url=excluded.image_url,
-          active=1
-      `).bind(
-        id, name, description, category,
-        Math.round(price * 100), stock, imageUrl
-      ).run();
-
-      return json({ ok: true, id });
     }
 
     if (method === "DELETE" && path.startsWith("/api/admin/products/")) {
@@ -394,12 +452,8 @@ async function api(request, env) {
       if (!name) return bad("Category name required.");
 
       const id = uid();
-
       try {
-        await env.DB.prepare(
-          "INSERT INTO categories (id,name) VALUES (?,?)"
-        ).bind(id, name).run();
-
+        await env.DB.prepare("INSERT INTO categories (id,name) VALUES (?,?)").bind(id, name).run();
         return json({ ok: true, id, name });
       } catch {
         return bad("Category already exists.", 409);
@@ -408,24 +462,16 @@ async function api(request, env) {
 
     if (method === "DELETE" && path.startsWith("/api/admin/categories/")) {
       const id = decodeURIComponent(path.split("/").pop());
-      const category = await env.DB.prepare(
-        "SELECT name FROM categories WHERE id=?"
-      ).bind(id).first();
+      const category = await env.DB.prepare("SELECT name FROM categories WHERE id=?").bind(id).first();
 
       if (category) {
         const count = await env.DB.prepare(
           "SELECT COUNT(*) AS n FROM products WHERE category=?"
         ).bind(category.name).first();
 
-        if (Number(count?.n || 0) > 0) {
-          return bad("Move or delete products in this category first.");
-        }
-
-        await env.DB.prepare(
-          "DELETE FROM categories WHERE id=?"
-        ).bind(id).run();
+        if (Number(count?.n || 0) > 0) return bad("Move or delete products in this category first.");
+        await env.DB.prepare("DELETE FROM categories WHERE id=?").bind(id).run();
       }
-
       return json({ ok: true });
     }
 
@@ -436,14 +482,12 @@ async function api(request, env) {
       for (const key of allowed) {
         if (typeof body?.[key] === "string") {
           const value = str(body[key], key === "banner_text" ? 300 : 160);
-
           await env.DB.prepare(`
             INSERT INTO settings (key,value) VALUES (?,?)
             ON CONFLICT(key) DO UPDATE SET value=excluded.value
           `).bind(key, value).run();
         }
       }
-
       return json({ ok: true });
     }
 
@@ -475,6 +519,18 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
+    if (url.pathname.startsWith("/media/") &&
+        (request.method === "GET" || request.method === "HEAD")) {
+      try {
+        const key = decodeURIComponent(url.pathname.slice("/media/".length));
+        if (!key || key.includes("..")) return new Response("Not found", { status: 404 });
+        return await mediaResponse(request, env, key);
+      } catch (error) {
+        console.error("Media error:", String(error));
+        return new Response("Media unavailable.", { status: 500 });
+      }
+    }
+
     if (url.pathname.startsWith("/api/")) {
       try {
         return await api(request, env);
@@ -490,3 +546,4 @@ export default {
     return env.ASSETS.fetch(request);
   }
 };
+
