@@ -1,7 +1,8 @@
-
+```javascript
 const ADMIN_EMAIL = "arjunmth2007@gmail.com";
 const ADMIN_PASSWORD = "Raftaar@123";
 const SESSION_DAYS = 7;
+const MAX_IMAGES = 5;
 
 const json = (data, status = 200, headers = {}) =>
   new Response(JSON.stringify(data), {
@@ -19,7 +20,9 @@ const enc = new TextEncoder();
 
 async function sha256(value) {
   const hash = await crypto.subtle.digest("SHA-256", enc.encode(value));
-  return [...new Uint8Array(hash)].map(x => x.toString(16).padStart(2, "0")).join("");
+  return [...new Uint8Array(hash)]
+    .map(x => x.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 async function passwordHash(password, salt) {
@@ -28,8 +31,16 @@ async function passwordHash(password, salt) {
 
 function cookieValue(request, name) {
   const cookie = request.headers.get("Cookie") || "";
-  const item = cookie.split(";").map(v => v.trim()).find(v => v.startsWith(`${name}=`));
-  return item ? decodeURIComponent(item.slice(name.length + 1)) : "";
+  const item = cookie.split(";").map(v => v.trim())
+    .find(v => v.startsWith(`${name}=`));
+
+  if (!item) return "";
+
+  try {
+    return decodeURIComponent(item.slice(name.length + 1));
+  } catch {
+    return "";
+  }
 }
 
 function sessionCookie(token, maxAge = SESSION_DAYS * 86400) {
@@ -39,10 +50,12 @@ function sessionCookie(token, maxAge = SESSION_DAYS * 86400) {
 async function getSession(request, env) {
   const token = cookieValue(request, "shopnix_session");
   if (!token) return null;
+
   const tokenHash = await sha256(token);
   const row = await env.DB.prepare(
     "SELECT user_id, role, expires_at FROM sessions WHERE token_hash = ? AND expires_at > ?"
   ).bind(tokenHash, Math.floor(Date.now() / 1000)).first();
+
   return row ? { ...row, tokenHash } : null;
 }
 
@@ -50,14 +63,20 @@ async function newSession(env, userId, role) {
   const token = `${uid()}${uid().replaceAll("-", "")}`;
   const tokenHash = await sha256(token);
   const expires = Math.floor(Date.now() / 1000) + SESSION_DAYS * 86400;
+
   await env.DB.prepare(
     "INSERT INTO sessions (token_hash,user_id,role,expires_at) VALUES (?,?,?,?)"
   ).bind(tokenHash, userId, role, expires).run();
+
   return token;
 }
 
 async function readBody(request) {
-  try { return await request.json(); } catch { return null; }
+  try {
+    return await request.json();
+  } catch {
+    return null;
+  }
 }
 
 function str(value, max = 500) {
@@ -70,21 +89,32 @@ function int(value, min = 0, max = 100000000) {
 }
 
 async function allSettings(env) {
-  const result = await env.DB.prepare("SELECT key,value FROM settings").all();
-  return Object.fromEntries((result.results || []).map(row => [row.key, row.value]));
+  const result = await env.DB.prepare(
+    "SELECT key,value FROM settings"
+  ).all();
+
+  return Object.fromEntries(
+    (result.results || []).map(row => [row.key, row.value])
+  );
 }
 
 async function ensureColumn(env, table, column, definition) {
-  const info = await env.DB.prepare(`PRAGMA table_info(${table})`).all();
+  const info = await env.DB.prepare(
+    `PRAGMA table_info(${table})`
+  ).all();
+
   if (!(info.results || []).some(row => row.name === column)) {
-    await env.DB.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run();
+    await env.DB.prepare(
+      `ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`
+    ).run();
   }
 }
 
 async function ensureSchema(env) {
   await env.DB.prepare(`
     CREATE TABLE IF NOT EXISTS categories (
-      id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL UNIQUE
     )
   `).run();
 
@@ -127,9 +157,12 @@ async function ensureSchema(env) {
 
 function productOut(p) {
   let images = [];
+
   try {
     const parsed = JSON.parse(p.images_json || "[]");
-    if (Array.isArray(parsed)) images = parsed;
+    if (Array.isArray(parsed)) {
+      images = parsed.filter(x => typeof x === "string" && x);
+    }
   } catch {}
 
   if (!images.length && p.image_url) images = [p.image_url];
@@ -148,77 +181,34 @@ function productOut(p) {
   };
 }
 
-function parseDataUrl(value) {
-  const match = /^data:([a-zA-Z0-9.+-]+\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)$/.exec(value || "");
-  if (!match) return null;
-
-  const mime = match[1].toLowerCase();
-  const allowed = new Set([
-    "image/jpeg", "image/png", "image/webp", "image/gif",
-    "video/mp4", "video/webm", "video/quicktime"
-  ]);
-
-  if (!allowed.has(mime)) throw new Error("Unsupported media type: " + mime);
-
-  const raw = atob(match[2].replace(/\s/g, ""));
-  const bytes = new Uint8Array(raw.length);
-  for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
-
-  const max = mime.startsWith("image/") ? 5 * 1024 * 1024 : 25 * 1024 * 1024;
-  if (bytes.byteLength > max) {
-    throw new Error(mime.startsWith("image/")
-      ? "Each image must be 5 MB or smaller."
-      : "Video must be 25 MB or smaller.");
+function validateCloudinaryUrl(value, type) {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new Error("Media URL is missing.");
   }
 
-  return { mime, bytes };
-}
-
-async function storeMedia(value, env, folder) {
-  if (typeof value !== "string" || !value) return "";
-  if (/^https:\/\//i.test(value) || value.startsWith("/media/")) return value;
-
-  const parsed = parseDataUrl(value);
-  if (!parsed) throw new Error("Media must be an HTTPS URL or a supported uploaded file.");
-
-  if (!env.MEDIA) {
-    throw new Error("R2 binding MEDIA missing. Add the shopnix-media bucket as MEDIA in Worker Settings > Bindings.");
+  let u;
+  try {
+    u = new URL(value.trim());
+  } catch {
+    throw new Error("Invalid media URL.");
   }
 
-  const ext = {
-    "image/jpeg": "jpg",
-    "image/png": "png",
-    "image/webp": "webp",
-    "image/gif": "gif",
-    "video/mp4": "mp4",
-    "video/webm": "webm",
-    "video/quicktime": "mov"
-  }[parsed.mime];
+  if (
+    u.protocol !== "https:" ||
+    u.hostname !== "res.cloudinary.com" ||
+    u.username ||
+    u.password
+  ) {
+    throw new Error("Use a valid HTTPS Cloudinary media URL.");
+  }
 
-  const key = `${folder}/${uid()}.${ext}`;
-  await env.MEDIA.put(key, parsed.bytes, {
-    httpMetadata: {
-      contentType: parsed.mime,
-      cacheControl: "public, max-age=31536000, immutable"
-    }
-  });
+  const path = u.pathname.toLowerCase();
 
-  return `/media/${key}`;
-}
+  if (!path.includes(`/${type}/upload/`)) {
+    throw new Error(`Invalid Cloudinary ${type} URL.`);
+  }
 
-async function mediaResponse(request, env, key) {
-  if (!env.MEDIA) return new Response("Media storage is not configured.", { status: 503 });
-
-  const object = await env.MEDIA.get(key);
-  if (!object) return new Response("Not found", { status: 404 });
-
-  const headers = new Headers();
-  object.writeHttpMetadata(headers);
-  headers.set("etag", object.httpEtag);
-  headers.set("cache-control", "public, max-age=31536000, immutable");
-  headers.set("x-content-type-options", "nosniff");
-
-  return new Response(request.method === "HEAD" ? null : object.body, { headers });
+  return u.href;
 }
 
 async function api(request, env) {
@@ -234,7 +224,9 @@ async function api(request, env) {
 
   if (method === "GET" && path === "/api/bootstrap") {
     const [products, categories, settings, visits] = await Promise.all([
-      env.DB.prepare("SELECT * FROM products WHERE active=1 ORDER BY created_at DESC").all(),
+      env.DB.prepare(
+        "SELECT * FROM products WHERE active=1 ORDER BY created_at DESC"
+      ).all(),
       env.DB.prepare("SELECT id,name FROM categories ORDER BY name").all(),
       allSettings(env),
       env.DB.prepare("SELECT COUNT(*) AS n FROM visits").first()
@@ -265,7 +257,10 @@ async function api(request, env) {
     if (name.length < 2 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       return bad("Enter a valid name and email.");
     }
-    if (password.length < 8) return bad("Password must be at least 8 characters.");
+
+    if (password.length < 8) {
+      return bad("Password must be at least 8 characters.");
+    }
 
     const id = uid();
     const salt = uid();
@@ -277,6 +272,7 @@ async function api(request, env) {
       ).bind(id, name, email, hash).run();
 
       const token = await newSession(env, id, "customer");
+
       return json({
         ok: true,
         user: { id, name, email, role: "customer" }
@@ -295,13 +291,20 @@ async function api(request, env) {
     const password = typeof body.password === "string" ? body.password : "";
 
     if (email === ADMIN_EMAIL.toLowerCase()) {
-      const valid = (await sha256(password)) === (await sha256(ADMIN_PASSWORD));
-      if (!valid) return bad("Email or password is incorrect.", 401);
+      if ((await sha256(password)) !== (await sha256(ADMIN_PASSWORD))) {
+        return bad("Email or password is incorrect.", 401);
+      }
 
       const token = await newSession(env, "admin", "admin");
+
       return json({
         ok: true,
-        user: { id: "admin", name: "Shopnix Admin", email: ADMIN_EMAIL, role: "admin" }
+        user: {
+          id: "admin",
+          name: "Shopnix Admin",
+          email: ADMIN_EMAIL,
+          role: "admin"
+        }
       }, 200, { "set-cookie": sessionCookie(token) });
     }
 
@@ -312,14 +315,24 @@ async function api(request, env) {
     if (!user) return bad("Email or password is incorrect.", 401);
 
     const parts = String(user.password_hash).split(":");
-    if (parts.length !== 2 || await passwordHash(password, parts[0]) !== parts[1]) {
+
+    if (
+      parts.length !== 2 ||
+      await passwordHash(password, parts[0]) !== parts[1]
+    ) {
       return bad("Email or password is incorrect.", 401);
     }
 
     const token = await newSession(env, user.id, "customer");
+
     return json({
       ok: true,
-      user: { id: user.id, name: user.name, email: user.email, role: "customer" }
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        role: "customer"
+      }
     }, 200, { "set-cookie": sessionCookie(token) });
   }
 
@@ -330,7 +343,12 @@ async function api(request, env) {
     if (session.role === "admin") {
       return json({
         ok: true,
-        user: { id: "admin", name: "Shopnix Admin", email: ADMIN_EMAIL, role: "admin" }
+        user: {
+          id: "admin",
+          name: "Shopnix Admin",
+          email: ADMIN_EMAIL,
+          role: "admin"
+        }
       });
     }
 
@@ -338,21 +356,34 @@ async function api(request, env) {
       "SELECT id,name,email FROM users WHERE id=?"
     ).bind(session.user_id).first();
 
-    return json({ ok: true, user: user ? { ...user, role: "customer" } : null });
+    return json({
+      ok: true,
+      user: user ? { ...user, role: "customer" } : null
+    });
   }
 
   if (method === "POST" && path === "/api/logout") {
     const session = await getSession(request, env);
+
     if (session) {
-      await env.DB.prepare("DELETE FROM sessions WHERE token_hash=?")
-        .bind(session.tokenHash).run();
+      await env.DB.prepare(
+        "DELETE FROM sessions WHERE token_hash=?"
+      ).bind(session.tokenHash).run();
     }
-    return json({ ok: true }, 200, { "set-cookie": sessionCookie("", 0) });
+
+    return json(
+      { ok: true },
+      200,
+      { "set-cookie": sessionCookie("", 0) }
+    );
   }
 
   if (path.startsWith("/api/admin/")) {
     const session = await getSession(request, env);
-    if (!session || session.role !== "admin") return bad("Admin login required.", 401);
+
+    if (!session || session.role !== "admin") {
+      return bad("Admin login required.", 401);
+    }
 
     if (method === "GET" && path === "/api/admin/data") {
       const [products, categories, settings, visits, customers] = await Promise.all([
@@ -384,35 +415,68 @@ async function api(request, env) {
       const price = Number(body.price);
       const stock = int(body.stock, 0, 1000000);
 
-      if (!name || !category || !Number.isFinite(price) ||
-          price < 0 || price > 10000000 || stock === null) {
+      if (
+        !name || !category || !Number.isFinite(price) ||
+        price < 0 || price > 10000000 || stock === null
+      ) {
         return bad("Check product name, category, price and stock.");
       }
 
       try {
-        let images = Array.isArray(body.images) ? body.images.slice(0, 5) : [];
         const old = await env.DB.prepare(
           "SELECT image_url,images_json,video_url FROM products WHERE id=?"
         ).bind(id).first();
 
-        if (!images.length && body.imageUrl) images = [body.imageUrl];
+        let images;
+
+        if (Object.prototype.hasOwnProperty.call(body, "images")) {
+          if (!Array.isArray(body.images)) {
+            return bad("Images must be an array.");
+          }
+
+          if (body.images.length > MAX_IMAGES) {
+            return bad("Maximum 5 images are allowed.");
+          }
+
+          images = body.images;
+        } else if (body.imageUrl) {
+          images = [body.imageUrl];
+        } else {
+          try {
+            images = JSON.parse(old?.images_json || "[]");
+            if (!Array.isArray(images)) images = [];
+          } catch {
+            images = [];
+          }
+
+          if (!images.length && old?.image_url) {
+            images = [old.image_url];
+          }
+        }
 
         const savedImages = [];
+
         for (const image of images) {
-          const saved = await storeMedia(str(image, 12000000), env, `products/${id}/images`);
-          if (saved) savedImages.push(saved);
+          if (typeof image !== "string" || !image.trim()) continue;
+
+          const saved = validateCloudinaryUrl(image, "image");
+
+          if (!savedImages.includes(saved)) {
+            savedImages.push(saved);
+          }
         }
 
-        let imageUrl = savedImages[0] || "";
-        let videoUrl = body.videoUrl
-          ? await storeMedia(str(body.videoUrl, 40000000), env, `products/${id}/videos`)
-          : "";
+        let videoUrl;
 
-        if (!images.length && old) {
-          imageUrl = old.image_url || "";
-          try { savedImages.push(...JSON.parse(old.images_json || "[]")); } catch {}
+        if (Object.prototype.hasOwnProperty.call(body, "videoUrl")) {
+          videoUrl = body.videoUrl
+            ? validateCloudinaryUrl(str(body.videoUrl, 4000), "video")
+            : "";
+        } else {
+          videoUrl = old?.video_url || "";
         }
-        if (!body.videoUrl && old) videoUrl = old.video_url || "";
+
+        const imageUrl = savedImages[0] || "";
 
         await env.DB.prepare(`
           INSERT INTO products
@@ -429,11 +493,24 @@ async function api(request, env) {
             video_url=excluded.video_url,
             active=1
         `).bind(
-          id, name, description, category, Math.round(price * 100), stock,
-          imageUrl, JSON.stringify(savedImages), videoUrl
+          id,
+          name,
+          description,
+          category,
+          Math.round(price * 100),
+          stock,
+          imageUrl,
+          JSON.stringify(savedImages),
+          videoUrl
         ).run();
 
-        return json({ ok: true, id, imageUrl, images: savedImages, videoUrl });
+        return json({
+          ok: true,
+          id,
+          imageUrl,
+          images: savedImages,
+          videoUrl
+        });
       } catch (error) {
         console.error("Product save error:", error?.stack || String(error));
         return bad(error?.message || "Could not save product media.", 400);
@@ -442,18 +519,27 @@ async function api(request, env) {
 
     if (method === "DELETE" && path.startsWith("/api/admin/products/")) {
       const id = decodeURIComponent(path.split("/").pop());
-      await env.DB.prepare("DELETE FROM products WHERE id=?").bind(id).run();
+
+      await env.DB.prepare(
+        "DELETE FROM products WHERE id=?"
+      ).bind(id).run();
+
       return json({ ok: true });
     }
 
     if (method === "POST" && path === "/api/admin/categories") {
       const body = await readBody(request);
       const name = str(body?.name, 100);
+
       if (!name) return bad("Category name required.");
 
       const id = uid();
+
       try {
-        await env.DB.prepare("INSERT INTO categories (id,name) VALUES (?,?)").bind(id, name).run();
+        await env.DB.prepare(
+          "INSERT INTO categories (id,name) VALUES (?,?)"
+        ).bind(id, name).run();
+
         return json({ ok: true, id, name });
       } catch {
         return bad("Category already exists.", 409);
@@ -462,16 +548,25 @@ async function api(request, env) {
 
     if (method === "DELETE" && path.startsWith("/api/admin/categories/")) {
       const id = decodeURIComponent(path.split("/").pop());
-      const category = await env.DB.prepare("SELECT name FROM categories WHERE id=?").bind(id).first();
+
+      const category = await env.DB.prepare(
+        "SELECT name FROM categories WHERE id=?"
+      ).bind(id).first();
 
       if (category) {
         const count = await env.DB.prepare(
           "SELECT COUNT(*) AS n FROM products WHERE category=?"
         ).bind(category.name).first();
 
-        if (Number(count?.n || 0) > 0) return bad("Move or delete products in this category first.");
-        await env.DB.prepare("DELETE FROM categories WHERE id=?").bind(id).run();
+        if (Number(count?.n || 0) > 0) {
+          return bad("Move or delete products in this category first.");
+        }
+
+        await env.DB.prepare(
+          "DELETE FROM categories WHERE id=?"
+        ).bind(id).run();
       }
+
       return json({ ok: true });
     }
 
@@ -482,12 +577,14 @@ async function api(request, env) {
       for (const key of allowed) {
         if (typeof body?.[key] === "string") {
           const value = str(body[key], key === "banner_text" ? 300 : 160);
+
           await env.DB.prepare(`
             INSERT INTO settings (key,value) VALUES (?,?)
             ON CONFLICT(key) DO UPDATE SET value=excluded.value
           `).bind(key, value).run();
         }
       }
+
       return json({ ok: true });
     }
 
@@ -519,23 +616,12 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    if (url.pathname.startsWith("/media/") &&
-        (request.method === "GET" || request.method === "HEAD")) {
-      try {
-        const key = decodeURIComponent(url.pathname.slice("/media/".length));
-        if (!key || key.includes("..")) return new Response("Not found", { status: 404 });
-        return await mediaResponse(request, env, key);
-      } catch (error) {
-        console.error("Media error:", String(error));
-        return new Response("Media unavailable.", { status: 500 });
-      }
-    }
-
     if (url.pathname.startsWith("/api/")) {
       try {
         return await api(request, env);
       } catch (error) {
         console.error("Shopnix API error:", error?.stack || String(error));
+
         return json({
           ok: false,
           error: "Server error. Check Cloudflare Workers > Observability > Logs."
@@ -546,4 +632,4 @@ export default {
     return env.ASSETS.fetch(request);
   }
 };
-
+```
