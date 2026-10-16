@@ -1,5 +1,9 @@
+
 const $ = (s, root = document) => root.querySelector(s);
 const $$ = (s, root = document) => [...root.querySelectorAll(s)];
+
+const CLOUDINARY_CLOUD_NAME = "qiy9vnud";
+const CLOUDINARY_UPLOAD_PRESET = "shopnix_unsigned";
 
 const state = {
   products: [],
@@ -17,7 +21,10 @@ const state = {
   adminData: null,
   editingId: null,
   selectedImages: [],
-  selectedVideo: null
+  selectedVideo: null,
+  removedImages: [],
+  removeVideo: false,
+  uploading: false
 };
 
 function readStore(key, fallback) {
@@ -85,21 +92,54 @@ async function api(path, options = {}) {
   return data;
 }
 
+/* CLOUDINARY UPLOAD */
+
+async function uploadToCloudinary(file, resourceType) {
+  if (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_UPLOAD_PRESET) {
+    throw new Error("Cloudinary configuration is missing.");
+  }
+
+  const formData = new FormData();
+  formData.append("file", file);
+  formData.append("upload_preset", CLOUDINARY_UPLOAD_PRESET);
+
+  const endpoint =
+    `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/${resourceType}/upload`;
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    body: formData
+  });
+
+  let result = {};
+  try {
+    result = await response.json();
+  } catch {}
+
+  if (!response.ok || !result.secure_url) {
+    throw new Error(
+      result.error?.message || `Upload failed for ${file.name}`
+    );
+  }
+
+  return result.secure_url;
+}
+
 function openLayer(id) {
-  $("#overlay").classList.add("show");
-  $("#" + id).classList.add("open");
+  $("#overlay")?.classList.add("show");
+  $("#" + id)?.classList.add("open");
 }
 
 function closeLayers() {
-  $("#overlay").classList.remove("show");
+  $("#overlay")?.classList.remove("show");
   $$(".drawer").forEach(x => x.classList.remove("open"));
   $$(".modal").forEach(x => x.classList.remove("show"));
 }
 
 function openModal(id) {
   closeLayers();
-  $("#overlay").classList.add("show");
-  $("#" + id).classList.add("show");
+  $("#overlay")?.classList.add("show");
+  $("#" + id)?.classList.add("show");
 }
 
 function productById(id) {
@@ -338,8 +378,8 @@ async function load() {
   try {
     const d = await api("/api/bootstrap");
 
-    state.products = d.products;
-    state.categories = d.categories;
+    state.products = d.products || [];
+    state.categories = d.categories || [];
     state.settings = d.settings || {};
     state.visits = d.visits || 0;
 
@@ -480,20 +520,14 @@ function orderOn(method) {
   closeLayers();
 }
 
-/* PRODUCT MEDIA UPLOAD + PREVIEW */
+/* PRODUCT MEDIA STATE */
 
 function resetProductMedia() {
   state.selectedImages = [];
   state.selectedVideo = null;
-}
-
-function readFileAsDataURL(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.onerror = () => reject(new Error(`Could not read ${file.name}`));
-    reader.readAsDataURL(file);
-  });
+  state.removedImages = [];
+  state.removeVideo = false;
+  state.uploading = false;
 }
 
 function renderMediaPreview() {
@@ -501,21 +535,57 @@ function renderMediaPreview() {
   const videoPreview = $("#product-video-preview");
 
   if (imagePreview) {
-    imagePreview.innerHTML = state.selectedImages.map((src, i) => `
+    const existing = state.editingId
+      ? state.adminData?.products?.find(p => p.id === state.editingId)
+      : null;
+
+    const existingImages = existing?.images?.length
+      ? existing.images
+      : (existing?.imageUrl ? [existing.imageUrl] : []);
+
+    const keptExisting = existingImages
+      .map((url, originalIndex) => ({ url, originalIndex }))
+      .filter(item => !state.removedImages.includes(item.originalIndex));
+
+    const oldHTML = keptExisting.map(item => `
       <div style="position:relative;display:inline-block;margin:5px">
-        <img src="${esc(src)}" alt="Product image ${i + 1}"
+        <img src="${esc(item.url)}" alt="Existing product image"
+          style="width:85px;height:85px;object-fit:cover;border-radius:10px">
+        <button type="button" data-remove-existing-image="${item.originalIndex}"
+          style="position:absolute;top:2px;right:2px;border:0;border-radius:50%;cursor:pointer">×</button>
+      </div>
+    `).join("");
+
+    const newHTML = state.selectedImages.map((src, i) => `
+      <div style="position:relative;display:inline-block;margin:5px">
+        <img src="${esc(src)}" alt="New product image"
           style="width:85px;height:85px;object-fit:cover;border-radius:10px">
         <button type="button" data-remove-image="${i}"
           style="position:absolute;top:2px;right:2px;border:0;border-radius:50%;cursor:pointer">×</button>
       </div>
     `).join("");
+
+    imagePreview.innerHTML = oldHTML + newHTML;
   }
 
   if (videoPreview) {
-    videoPreview.innerHTML = state.selectedVideo
-      ? `<video src="${esc(state.selectedVideo)}" controls
-          style="max-width:220px;max-height:150px;border-radius:10px"></video>`
-      : "";
+    const existing = state.editingId
+      ? state.adminData?.products?.find(p => p.id === state.editingId)
+      : null;
+
+    if (state.selectedVideo) {
+      videoPreview.innerHTML = `
+        <video src="${esc(state.selectedVideo)}" controls
+          style="max-width:220px;max-height:150px;border-radius:10px"></video>
+        <button type="button" class="secondary-btn" id="remove-selected-video">Remove new video</button>`;
+    } else if (existing?.videoUrl && !state.removeVideo) {
+      videoPreview.innerHTML = `
+        <video src="${esc(existing.videoUrl)}" controls
+          style="max-width:220px;max-height:150px;border-radius:10px"></video>
+        <button type="button" class="secondary-btn" id="remove-existing-video">Remove video</button>`;
+    } else {
+      videoPreview.innerHTML = "";
+    }
   }
 }
 
@@ -523,6 +593,8 @@ async function openAdmin() {
   try {
     state.adminData = await api("/api/admin/data");
     state.adminTab = "products";
+    state.editingId = null;
+    resetProductMedia();
     renderAdmin();
     openModal("admin-modal");
   } catch (e) {
@@ -578,7 +650,7 @@ function adminPanelHTML(d) {
         <label>Category
           <select name="category" required>
             ${d.categories.map(c => `
-              <option ${p?.category === c.name ? "selected" : ""}>
+              <option value="${esc(c.name)}" ${p?.category === c.name ? "selected" : ""}>
                 ${esc(c.name)}
               </option>
             `).join("")}
@@ -598,7 +670,7 @@ function adminPanelHTML(d) {
         <label class="wide">
           Product photos (maximum 5)
           <input id="product-images" type="file" accept="image/*" multiple>
-          <small>Select up to 5 photos. Each image must be 2 MB or smaller.</small>
+          <small>Select up to 5 photos, 2 MB maximum each. New uploads are added to existing photos.</small>
         </label>
 
         <div id="product-image-preview" class="wide" style="display:flex;flex-wrap:wrap">
@@ -606,7 +678,7 @@ function adminPanelHTML(d) {
             <div style="position:relative;display:inline-block;margin:5px">
               <img src="${esc(src)}" alt="Product image ${i + 1}"
                 style="width:85px;height:85px;object-fit:cover;border-radius:10px">
-              <button type="button" data-remove-image="${i}"
+              <button type="button" data-remove-existing-image="${i}"
                 style="position:absolute;top:2px;right:2px;border:0;border-radius:50%;cursor:pointer">×</button>
             </div>
           `).join("")}
@@ -618,14 +690,17 @@ function adminPanelHTML(d) {
         </label>
 
         <div id="product-video-preview" class="wide">
-          ${p?.videoUrl ? `<video src="${esc(p.videoUrl)}" controls style="max-width:220px;max-height:150px"></video>` : ""}
+          ${p?.videoUrl ? `
+            <video src="${esc(p.videoUrl)}" controls style="max-width:220px;max-height:150px"></video>
+            <button type="button" class="secondary-btn" id="remove-existing-video">Remove video</button>
+          ` : ""}
         </div>
 
         <label class="wide">Description
           <textarea name="description" rows="2" maxlength="1000">${esc(p?.description || "")}</textarea>
         </label>
 
-        <button class="primary-btn" type="submit">
+        <button class="primary-btn" type="submit" ${state.uploading ? "disabled" : ""}>
           ${p ? "Save changes" : "Add product"} ↗
         </button>
 
@@ -727,18 +802,32 @@ function downloadJson(data, name) {
   a.href = url;
   a.download = name;
   a.click();
-  URL.revokeObjectURL(url);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-/* IMAGE SELECTION */
+/* MEDIA FILE SELECTION AND UPLOAD */
 
 $("#admin-content").addEventListener("change", async e => {
   if (e.target.id === "product-images") {
     const files = [...e.target.files];
 
-    if (files.length > 5) {
+    if (!files.length) return;
+
+    const existing = state.editingId
+      ? state.adminData?.products?.find(p => p.id === state.editingId)
+      : null;
+
+    const oldImages = existing?.images?.length
+      ? existing.images
+      : (existing?.imageUrl ? [existing.imageUrl] : []);
+
+    const keptCount = oldImages.filter(
+      (_, i) => !state.removedImages.includes(i)
+    ).length;
+
+    if (keptCount + state.selectedImages.length + files.length > 5) {
       e.target.value = "";
-      toast("Maximum 5 photos allowed.");
+      toast(`Maximum 5 images total. You already have ${keptCount + state.selectedImages.length}.`);
       return;
     }
 
@@ -755,37 +844,55 @@ $("#admin-content").addEventListener("change", async e => {
     }
 
     try {
-      state.selectedImages = await Promise.all(
-        files.map(readFileAsDataURL)
+      state.uploading = true;
+      toast("Uploading images to Cloudinary...");
+
+      const uploaded = await Promise.all(
+        files.map(file => uploadToCloudinary(file, "image"))
       );
+
+      state.selectedImages.push(...uploaded);
       renderMediaPreview();
+      toast("Images uploaded successfully!");
     } catch (err) {
       toast(err.message);
+    } finally {
+      state.uploading = false;
+      e.target.value = "";
     }
   }
 
   if (e.target.id === "product-video") {
     const file = e.target.files[0];
-
     if (!file) return;
 
     if (!file.type.startsWith("video/")) {
       e.target.value = "";
       toast("Please select a video file.");
+      e.target.value = "";
       return;
     }
 
     if (file.size > 5 * 1024 * 1024) {
       e.target.value = "";
       toast("Video must be 5 MB or smaller.");
+      e.target.value = "";
       return;
     }
 
     try {
-      state.selectedVideo = await readFileAsDataURL(file);
+      state.uploading = true;
+      toast("Uploading video to Cloudinary...");
+
+      state.selectedVideo = await uploadToCloudinary(file, "video");
+      state.removeVideo = false;
       renderMediaPreview();
+      toast("Video uploaded successfully!");
     } catch (err) {
       toast(err.message);
+    } finally {
+      state.uploading = false;
+      e.target.value = "";
     }
   }
 });
@@ -796,6 +903,28 @@ document.addEventListener("click", async e => {
 
   if (t.matches("[data-remove-image]")) {
     state.selectedImages.splice(Number(t.dataset.removeImage), 1);
+    renderMediaPreview();
+    return;
+  }
+
+  if (t.matches("[data-remove-existing-image]")) {
+    const index = Number(t.dataset.removeExistingImage);
+    if (!state.removedImages.includes(index)) {
+      state.removedImages.push(index);
+    }
+    renderMediaPreview();
+    return;
+  }
+
+  if (t.id === "remove-selected-video") {
+    state.selectedVideo = null;
+    renderMediaPreview();
+    return;
+  }
+
+  if (t.id === "remove-existing-video") {
+    state.removeVideo = true;
+    state.selectedVideo = null;
     renderMediaPreview();
     return;
   }
@@ -899,6 +1028,7 @@ document.addEventListener("click", async e => {
     state.adminTab = "products";
     resetProductMedia();
     renderAdmin();
+    renderMediaPreview();
     return;
   }
 
@@ -909,6 +1039,7 @@ document.addEventListener("click", async e => {
           method: "DELETE"
         });
         state.editingId = null;
+        resetProductMedia();
         await reloadAdmin();
         toast("Product deleted.");
       } catch (err) {
@@ -1013,6 +1144,11 @@ $("#admin-content").addEventListener("submit", async e => {
 
   try {
     if (form.id === "product-form") {
+      if (state.uploading) {
+        toast("Please wait for media uploads to finish.");
+        return;
+      }
+
       const data = Object.fromEntries(fd.entries());
 
       data.price = Number(data.price);
@@ -1024,18 +1160,30 @@ $("#admin-content").addEventListener("submit", async e => {
         ? state.adminData.products.find(p => p.id === state.editingId)
         : null;
 
-      if (state.selectedImages.length) {
-        data.images = state.selectedImages;
-        data.imageUrl = state.selectedImages[0];
-      } else if (existing) {
-        data.images = existing.images || [];
-        data.imageUrl = existing.imageUrl || "";
+      const oldImages = existing?.images?.length
+        ? existing.images
+        : (existing?.imageUrl ? [existing.imageUrl] : []);
+
+      const keptImages = oldImages.filter(
+        (_, index) => !state.removedImages.includes(index)
+      );
+
+      const finalImages = [...keptImages, ...state.selectedImages];
+
+      if (finalImages.length > 5) {
+        toast("Maximum 5 product images allowed.");
+        return;
       }
+
+      data.images = finalImages;
+      data.imageUrl = finalImages[0] || "";
 
       if (state.selectedVideo) {
         data.videoUrl = state.selectedVideo;
-      } else if (existing?.videoUrl) {
-        data.videoUrl = existing.videoUrl;
+      } else if (state.removeVideo) {
+        data.videoUrl = "";
+      } else {
+        data.videoUrl = existing?.videoUrl || "";
       }
 
       await api("/api/admin/products", {
@@ -1046,7 +1194,7 @@ $("#admin-content").addEventListener("submit", async e => {
       state.editingId = null;
       resetProductMedia();
       await reloadAdmin();
-      toast("Product saved.");
+      toast("Product saved successfully.");
     }
 
     if (form.id === "category-form") {
